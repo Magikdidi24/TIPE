@@ -1,254 +1,201 @@
-import math
-import random
+from contextlib import nullcontext
+from multiprocessing import Pool
+from typing import List
 
 import numpy as np
 
-from typing import List, Tuple
-from SnakeGame import SnakeGame
+from NeuralNetwork import NeuralPlayer, generate_indiv
+from SnakeGame import MOVES, SNAKE_SIZE, SnakeGame
 
-LEFT = (0, -1)
-RIGHT = (0, 1)
-UP = (-1, 0)
-DOWN = (1, 0)
+# Réglages par défaut (repris par main.py train)
+SIZE = 20  # Taille de la grille (size x size).
+POP_SIZE = 200  # Taille de la population (30 dans le rapport : trop peu pour apprendre).
+NUM_GEN = 300  # Nombre de générations.
+WINDOW_SIZE = 7  # Taille de la fenêtre de vision du serpent.
+HIDDEN_SIZE = 8  # Taille des 2 couches cachées du réseau de neurones.
+MAX_ITER = 100  # Nombre maximal de déplacements sans manger (famine).
+MUTATION_CHANCE = 0.5  # Probabilité de mutation de chaque poids.
+MUTATION_SIZE = 0.2  # Amplitude maximale d'une mutation.
+N_GAMES = 5  # Parties jouées par chaque serpent (fitness moyenne).
 
-MOVES = [LEFT, RIGHT, UP, DOWN]
+# Graines jamais tirées pendant l'entraînement (qui tire dans [0, 2^31)) : des parties nouvelles
+SELECTION_SEEDS = range(2**31, 2**31 + 100)  # choix final du meilleur serpent
+TEST_SEEDS = range(2**31 + 100, 2**31 + 130)  # courbe de test : les mêmes 30 parties à chaque génération
 
 
-class GeneticAlgorithm(object):
+def get_fitness(game: SnakeGame):
+    """Fitness du rapport : nombre de déplacements x 2^(pommes mangées)."""
+    return game.iter * 2.0**game.score
+
+
+def play_games(args):
+    """Fait jouer un individu une partie par graine.
+
+    Renvoie (fitness moyenne, nombre moyen de pommes). Fonction de module pour
+    pouvoir être envoyée aux processus de multiprocessing.Pool.
+    """
+    indiv, seeds, size, window_size, max_iter = args
+    fitness, apples = [], []
+    for seed in seeds:
+        player = NeuralPlayer(indiv, window_size)
+        game = SnakeGame(size, SNAKE_SIZE, player, max_iter=max_iter, seed=seed)
+        game.run()
+        fitness.append(get_fitness(game))
+        apples.append(game.score)
+    return np.mean(fitness), np.mean(apples)
+
+
+class GeneticAlgorithm:
     def __init__(
         self,
-        size: int,
-        pop_size: int,
-        num_gen: int,
-        window_size: int,
-        hidden_size: int,
-        max_iter=100,
-        mutation_chance=0.1,
-        mutation_size=0.1,
-        display=False,
+        size: int = SIZE,
+        pop_size: int = POP_SIZE,
+        num_gen: int = NUM_GEN,
+        window_size: int = WINDOW_SIZE,
+        hidden_size: int = HIDDEN_SIZE,
+        max_iter=MAX_ITER,
+        mutation_chance=MUTATION_CHANCE,
+        mutation_size=MUTATION_SIZE,
+        n_games=N_GAMES,
+        seed=None,
     ):
+        if pop_size < 8:
+            raise ValueError("pop_size doit valoir au moins 8 (il faut 2 parents dans le top 25 %)")
+        if window_size % 2 == 0:
+            raise ValueError("window_size doit être impair")
+        if num_gen < 1:
+            raise ValueError("num_gen doit valoir au moins 1")
+        if n_games < 1:
+            raise ValueError("n_games doit valoir au moins 1")
+        if not 0 <= mutation_chance <= 1:
+            raise ValueError("mutation_chance doit être entre 0 et 1")
         self.size = size
 
         self.pop_size = pop_size
         self.num_gen = num_gen
 
         self.window_size = window_size
-        self.input_size = self.window_size ** 2
+        self.input_size = self.window_size**2 + 4  # vision + direction de la pomme
         self.hidden_size = hidden_size
+        self.output_size = len(MOVES)
 
         self.max_iter = max_iter
-
-        self.display = display
-
-        self.output_size = len(MOVES)
+        self.n_games = n_games  # parties par individu (on moyenne pour réduire le hasard)
 
         self.mutation_chance = mutation_chance
         self.mutation_size = mutation_size
 
-        self.current_individual = None
+        # Un seul générateur aléatoire, initialisé par la graine : résultats reproductibles
+        self.rng = np.random.default_rng(seed)
 
-        self.pop = [
-            self.generate_indiv(self.input_size, self.hidden_size, self.output_size)
-            for _ in range(pop_size)
+        self.pop = [self.new_indiv() for _ in range(pop_size)]
+        self.history = []  # statistiques de chaque génération
+        self.best = None  # meilleur individu de la dernière génération (après run : choix final)
+
+    def new_indiv(self):
+        return generate_indiv(self.input_size, self.hidden_size, self.output_size, self.rng)
+
+    def evaluate(self, pool=None):
+        """Fait jouer toute la population sur les mêmes parties (mêmes graines)."""
+        seeds = self.rng.integers(2**31, size=self.n_games).tolist()
+        args = [(indiv, seeds, self.size, self.window_size, self.max_iter) for indiv in self.pop]
+        results = list((pool.map if pool else map)(play_games, args))
+        fitness, apples = np.array(results).T
+        return fitness, apples
+
+    def one_generation(self, pool=None):
+        if self.history:  # nouvelle population, à partir du top rank de la génération précédente
+            self.pop = self.reproduce(self.top_25)
+        fitness, apples = self.evaluate(pool)
+
+        order = np.argsort(-fitness, kind="stable")  # du meilleur au moins bon
+        self.best = self.pop[order[0]]
+        stats = {
+            "generation": len(self.history),
+            "best_fitness": float(fitness[order[0]]),
+            "mean_fitness": float(fitness.mean()),
+            "best_apples": float(apples[order[0]]),
+            "mean_apples": float(apples.mean()),
+            "test_apples": float(self.held_out_apples([self.best], TEST_SEEDS, pool)[0]),
+        }
+        self.history.append(stats)
+
+        self.top_25 = [self.pop[i] for i in order[: self.pop_size // 4]]
+        return stats
+
+    def held_out_apples(self, indivs, seeds, pool=None):
+        """Pommes par partie de chaque individu, sur des parties jamais utilisées pour la sélection."""
+        args = [
+            (indiv, [seed], self.size, self.window_size, self.max_iter) for indiv in indivs for seed in seeds
         ]
+        apples = [a for _, a in (pool.map if pool else map)(play_games, args)]
+        return np.reshape(apples, (len(indivs), len(seeds))).mean(axis=1)
 
-    def generate_indiv(self, input_size: int, hidden_size: int, output_size: int):
-        hidden_layer1 = np.array(
-            [
-                [random.uniform(-1, 1) for _ in range(input_size + 1)]
-                for _ in range(hidden_size)
-            ]
+    def run(self, workers=1):
+        """Lance num_gen générations et renvoie le meilleur individu.
+
+        Le premier de la dernière génération est classé sur n_games parties seulement : c'est
+        souvent un serpent chanceux. On rejoue donc les 10 premiers sur 100 parties nouvelles
+        et on garde celui qui y mange le plus de pommes.
+        """
+        with Pool(workers) if workers > 1 else nullcontext() as pool:
+            for _ in range(self.num_gen):
+                s = self.one_generation(pool)
+                print(
+                    f"Génération {s['generation']:4d} | "
+                    f"fitness max {s['best_fitness']:10.4g}  moy {s['mean_fitness']:10.4g} | "
+                    f"pommes meilleur {s['best_apples']:5.1f}  moy {s['mean_apples']:5.2f}  "
+                    f"test {s['test_apples']:5.2f}",
+                    flush=True,
+                )
+            candidates = self.top_25[:10]
+            apples = self.held_out_apples(candidates, SELECTION_SEEDS, pool)
+            self.best = candidates[int(np.argmax(apples))]
+        print(
+            f"Choix final, pommes par partie sur {len(SELECTION_SEEDS)} parties nouvelles : "
+            f"premier de la dernière génération {apples[0]:.2f}, serpent gardé {apples.max():.2f}"
         )
-        hidden_layer2 = np.array(
-            [
-                [random.uniform(-1, 1) for _ in range(hidden_size + 1)]
-                for _ in range(hidden_size)
-            ]
-        )
-        output_layer = np.array(
-            [
-                [random.uniform(-1, 1) for _ in range(hidden_size + 1)]
-                for _ in range(output_size)
-            ]
-        )
-        return [hidden_layer1, hidden_layer2, output_layer]
+        return self.best
 
-    def vizualize_grid(self, grid: np.array, y_head: int, x_head: int):
-        # Initialize vision
-        snake_vision = [
-            [0 for _ in range(self.window_size)] for _ in range(self.window_size)
-        ]
-
-        # Compute vision from actual grid
-        for i in range(self.window_size):
-            ii = y_head - self.window_size // 2 + i
-            for j in range(self.window_size):
-                jj = x_head - self.window_size // 2 + j
-                if (
-                    ii < 0 or jj < 0 or ii >= self.size or jj >= self.size# attention à pas dépasser le tableau
-                ):  # there is a part of his body
-                    snake_vision[i][j] = -1
-                elif grid[ii][jj] == 2:  # there is food
-                    snake_vision[i][j] = 1
-                elif grid[ii][jj] == 0:
-                    snake_vision[i][j] = 0
-                else:
-                    snake_vision[i][j] = -1
-
-        # Flatten the matrix into a vector as the neural network takes a vector as an input
-        input_vector = list(np.array(snake_vision).flatten()) + [1]
-        input_vector = np.array(input_vector)
-
-        return input_vector
-
-    def get_action(self, snake: List[Tuple[int, int]], grid: np.array):
-        input_vector = self.vizualize_grid(grid, snake[-1][0], snake[-1][1])
-        hidden_layer1 = self.current_individual[0]
-        hidden_layer2 = self.current_individual[1]
-        output_layer = self.current_individual[2]
-
-        # Forward propagation
-        hidden_result1 = np.array(
-            [
-                math.tanh(np.dot(input_vector, hidden_layer1[i])) # tangente hyperbolique ?
-                for i in range(hidden_layer1.shape[0])
-            ]
-            + [1]
-        )
-        hidden_result2 = np.array(
-            [
-                math.tanh(np.dot(hidden_result1, hidden_layer2[i]))
-                for i in range(hidden_layer2.shape[0])
-            ]
-            + [1]
-        )
-        output_result = np.array(
-            [
-                math.tanh(np.dot(hidden_result2, output_layer[i]))
-                for i in range(output_layer.shape[0])
-            ]
-        )
-
-        max_index = np.argmax(output_result)
-
-        return MOVES[max_index]
-
-    def get_fitness(self, game: SnakeGame):
-        score = len(game.snake) - game.snake_size
-        return game.iter * 2 ** score
-
-    def one_generation(self, eating=False):
-        scores = [0 for _ in range(self.pop_size)]
-        max_score = 0
-
-        for i in range(self.pop_size):
-
-            if self.display:
-                print(f"Snake {i} est en cours...")
-
-            self.current_individual = self.pop[i]
-
-            game = SnakeGame(
-                self.size, self.size // 3, self, eating=eating, max_iter=self.max_iter
-            )
-            outcome = game.run()
-            if eating:
-                score = self.get_fitness(game)
-            else:
-                score = game.iter  # ACTUALISATION
-
-            scores[i] += score
-
-            if self.display:
-                print(f"Score: {score}\n")
-                if outcome == 0:
-                    print(f"Snake {i} en vie !\n")
-
-            if score > max_score:
-                max_score = score
-                if self.display:
-                    print(f"Max score: {max_score}, at ID {i}\n")
-
-        top_25_indexes = list(np.argsort(scores))[
-            3 * (self.pop_size // 4) : self.pop_size
-        ]
-
-        print(f"Scores : {scores}")
-
-        top_25 = [self.pop[i] for i in top_25_indexes][::-1]
-        self.pop = self.reproduce(top_25)
-
-    def run(self, eating=False):
-        num_gen = self.num_gen if eating else self.num_gen
-
-        for i in range(num_gen):
-            self.one_generation(eating)
-            print(f"---------------------- Generation {i+1}")
-
-            if i % 100 == 0 or (i == num_gen - 1):
-                print("Displaying the top 3 individuals:")
-                for indiv in self.pop[:3]:
-                    self.current_individual = indiv
-                    game = SnakeGame(
-                        self.size,
-                        self.size // 3,
-                        self,
-                        eating=eating,
-                        max_iter=self.max_iter,
-                        display=True,
-                    )
-                    outcome = game.run(display=True)
-
-        input("Press a key to display the top 3")
-        for indiv in self.pop[:3]:
-            self.current_individual = indiv
-            game = SnakeGame(
-                self.size,
-                self.size // 3,
-                self,
-                eating=eating,
-                max_iter=self.max_iter,
-                display=True,
-            )
-            outcome = game.run(display=True)
-
-    def reproduce(self, top_25: List[np.array]):
+    def reproduce(self, top_25: List[List[np.ndarray]]):
         """Generate a new population from the best of the previous one
 
+        Comme dans le rapport, la nouvelle population est formée de :
+          1. le top rank (25 % meilleurs), recopié tel quel (élitisme) ;
+          2. des enfants : croisement de deux parents du top rank, puis mutation ;
+          3. une mutation de chaque individu du top rank ;
+          4. quelques individus aléatoires (préservation de la diversité génétique).
+
         Args:
-            top_25 (List[np.array]): Represent a list of the top 25 individuals of the generation
+            top_25 (List[List[np.ndarray]]): the best individuals, best first
 
         Returns:
-            [List[np.array]]: Return the new population
+            [List[List[np.ndarray]]]: the new population (pop_size individuals)
         """
-        new_pop = []
-        for indiv in top_25:
-            new_pop.append(indiv)
-        for indiv in top_25:
-            new_indiv = self.mutate(indiv)
-            new_pop.append(new_indiv)
-        for _ in range(self.pop_size // 2):
-            new_pop.append(
-                self.generate_indiv(self.input_size, self.hidden_size, self.output_size)
-            )
+        n_random = self.pop_size // 10
+        n_children = self.pop_size - 2 * len(top_25) - n_random
+
+        new_pop = list(top_25)
+        for _ in range(n_children):
+            i, j = self.rng.choice(len(top_25), 2, replace=False)
+            new_pop.append(self.mutate(self.crossover(top_25[i], top_25[j])))
+        new_pop += [self.mutate(indiv) for indiv in top_25]
+        new_pop += [self.new_indiv() for _ in range(n_random)]
         return new_pop
 
-    def mutate(self, indiv: np.array):
-        """Randomly change weights in an individual
+    def crossover(self, parent1, parent2):
+        """Croisement uniforme : chaque poids vient de l'un ou l'autre parent (probabilité 1/2)."""
+        return [
+            np.where(self.rng.random(layer1.shape) < 0.5, layer1, layer2)
+            for layer1, layer2 in zip(parent1, parent2)
+        ]
 
-        Args:
-            indiv (np.array): The actual individual to mutate
-
-        Returns:
-            [np.array]: Return the mutated individual
-        """
+    def mutate(self, indiv):
+        """Mutation de point : chaque poids est modifié avec la probabilité mutation_chance,
+        d'une valeur uniforme(-1, 1) x mutation_size."""
         new_indiv = []
         for layer in indiv:
-            new_layer = np.copy(layer)
-            for i in range(new_layer.shape[0]):
-                for j in range(new_layer.shape[1]):
-                    rand = random.uniform(0, 1)
-                    if rand <= self.mutation_chance:
-                        new_layer[i][j] += random.uniform(-1, 1) * self.mutation_size
-            new_indiv.append(new_layer)
+            mask = self.rng.random(layer.shape) < self.mutation_chance
+            noise = self.rng.uniform(-1, 1, layer.shape) * self.mutation_size
+            new_indiv.append(layer + mask * noise)
         return new_indiv
